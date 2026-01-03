@@ -1,0 +1,5 @@
+fastf1>=3.4.0
+numpy>=1.24.0
+rich>=13.5.0
+numba>=0.58.0
+ipython>=8.15.0
