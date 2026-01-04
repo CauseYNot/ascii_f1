@@ -4,7 +4,7 @@ import numpy as np
 import os
 
 class TelemetryLoader:
-    def __init__(self, year, gp, identifier, backend='fastf1', cache_dir='.fastf1_cache'):
+    def __init__(self, year, gp, identifier, backend='fastf1', cache_dir='./.fastf1_cache/'):
         self.year = year
         self.gp = gp
         self.identifier = identifier
@@ -23,7 +23,7 @@ class TelemetryLoader:
         return session
     
 class RacetrackDatabaseLoader:
-    def __init__(self, gp, database_dir='../racetrack-database/'):
+    def __init__(self, gp, database_dir='./racetrack-database/'):
         self.gp = gp
         self.database_dir = database_dir
     
