@@ -5,14 +5,13 @@ import time
 from datetime import datetime
 from itertools import groupby
 
+import numpy as np
 import pandas as pd
 from loaders import *
-# from rich.box import box
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
-from copy import deepcopy
 
 DRS_KEY = {
     0: '[bold red]OFF[/]',
@@ -44,7 +43,7 @@ CONSTRUCTOR_COLOUR_KEY = {
     'Haas F1 Team': '#9C9FA2',
 }
 def _generate_throttle_gradient(n_colors):
-    s = (255, 0, 0) # FF0000 (red)
+    s = (0, 127, 0) # FF0000 (red)
     f = (0, 255, 0) # 00FF00 (green)
     gradient_hex = []
     for i in range(n_colors):
@@ -58,7 +57,7 @@ def _generate_throttle_gradient(n_colors):
     return gradient_hex
 
 class DriverViewAsciiPanel:
-    def __init__(self, panel_width, panel_height, laps_data, track_data, fov, lookahead, camera_height, horizon_y, vertical_scale):
+    def __init__(self, panel_width, panel_height, laps_data, track_data, fov, lookahead, camera_height, horizon_y):
         self.laps_data = laps_data
         self.telemetry = laps_data.telemetry
         self.track_data = track_data
@@ -68,7 +67,8 @@ class DriverViewAsciiPanel:
         self.lookahead = lookahead
         self.camera_height = camera_height
         self.horizon_y = horizon_y
-        self.vertical_scale = vertical_scale
+        
+        self.focal_length = (self.panel_width / 2) / math.tan(math.radians(self.fov) / 2)
 
         self.x_car = self.telemetry['X'].to_numpy()/10
         self.y_car = self.telemetry['Y'].to_numpy()/10
@@ -77,62 +77,35 @@ class DriverViewAsciiPanel:
         self.width_left = self.track_data['w_tr_left_m']
         self.width_right = self.track_data['w_tr_right_m']
         
-        self.x_car_min, self.x_car_max = self.x_car.min(), self.x_car.max()
-        self.y_car_min, self.y_car_max = self.y_car.min(), self.y_car.max()
-        self.x_track_min, self.x_track_max = self.x_track.min(), self.x_track.max()
-        self.y_track_min, self.y_track_max = self.y_track.min(), self.y_track.max()
+        self.x_track_min, self.y_track_min = self.x_track.min(), self.y_track.min()
+        self.x_car_min, self.y_car_min = self.x_car.min(), self.y_car.min()
+        self.x_scale = (self.x_track.max() - self.x_track.min()) / (self.x_car.max() - self.x_car.min())
+        self.y_scale = (self.y_track.max() - self.y_track.min()) / (self.y_car.max() - self.y_car.min())
         
-    #     # convert FastF1 telemetry to metres
-    #     car_pts = np.column_stack([
-    #         self.x_car * 0.1,
-    #         self.y_car * 0.1
-    #     ])
+        # Stack track points
+        self.track_xy = np.column_stack((self.x_track, self.y_track))
 
-    #     track_pts = np.column_stack([
-    #         self.x_track,
-    #         self.y_track
-    #     ])
+        # Compute forward differences (vectorised)
+        dx = np.roll(self.x_track, -1) - self.x_track
+        dy = np.roll(self.y_track, -1) - self.y_track
 
-    #     # resample to equal length
-    #     N = 500
-    #     car_sample = car_pts[np.linspace(0, len(car_pts)-1, N).astype(int)]
-    #     track_sample = track_pts[np.linspace(0, len(track_pts)-1, N).astype(int)]
+        # Avoid last-point glitch
+        dx[-1] = self.x_track[-1] - self.x_track[-2]
+        dy[-1] = self.y_track[-1] - self.y_track[-2]
 
-    #     self.scale, self.R, self.t = self._compute_similarity_transform(
-    #         car_sample, track_sample
-    #     )
+        # Normalise tangents
+        lengths = np.hypot(dx, dy)
+        dx /= lengths
+        dy /= lengths
 
-    # def _compute_similarity_transform(self, src, dst):
-    #     src_mean = src.mean(axis=0)
-    #     dst_mean = dst.mean(axis=0)
-
-    #     src_c = src - src_mean
-    #     dst_c = dst - dst_mean
-
-    #     cov = dst_c.T @ src_c / len(src)
-    #     U, S, Vt = np.linalg.svd(cov)
-
-    #     R = U @ Vt
-    #     if np.linalg.det(R) < 0:
-    #         Vt[-1, :] *= -1
-    #         R = U @ Vt
-
-    #     scale = np.trace(np.diag(S)) / np.sum(src_c**2)
-    #     t = dst_mean - scale * (R @ src_mean)
-
-    #     return scale, R, t
-
-    # def _car_to_track_co_ords(self, car_x, car_y):
-    #     p = np.array([car_x * 0.1, car_y * 0.1])  # dm → m
-    #     return tuple(self.scale * (self.R @ p) + self.t)
+        # Normals (perpendicular)
+        self.normals = np.column_stack((-dy, dx))
     
     def _car_to_track_co_ords(self, car_x, car_y):
-        x_car_fraction = (car_x - self.x_car_min) / (self.x_car_max - self.x_car_min)
-        x_track_converted = self.x_track_min + (x_car_fraction) * (self.x_track_max - self.x_track_min)
-        y_car_fraction = (car_y - self.y_car_min) / (self.y_car_max - self.y_car_min)
-        y_track_converted = self.y_track_min + (y_car_fraction) * (self.y_track_max - self.y_track_min)
-
-        return x_track_converted, y_track_converted
+        return (
+            self.x_track_min + (car_x - self.x_car_min) * self.x_scale,
+            self.y_track_min + (car_y - self.y_car_min) * self.y_scale
+        )
 
     def _calculate_car_heading(self, i, window=1):
         # takes the angle between points [window] ahead and behind of the current telemetry position. defaults to beginning/end of telemetry points.
@@ -150,111 +123,162 @@ class DriverViewAsciiPanel:
             dx = self.x_track[j + window] - self.x_track[j]
             dy = self.y_track[j + window] - self.y_track[j]
         else:
-            # default to the backward difference if we're at the end of the lap
+            # default to the backward difference if we're at the end of the lap data
             dx = self.x_track[j] - self.x_track[j - window]
             dy = self.y_track[j] - self.y_track[j - window]
 
         return math.atan2(dy, dx)
 
-    def _project_point(self, point_x, point_y, cam_x, cam_y, heading):
-        dx = point_x - cam_x
-        dy = point_y - cam_y
-
-        cos_h = math.cos(-heading)
-        sin_h = math.sin(-heading)
-
-        # camera-space coordinates
-        x_rel = dx * cos_h - dy * sin_h   # left/right
-        y_rel = dx * sin_h + dy * cos_h   # forward
-        
-        if y_rel <= 0:
-            return None
-        
-        # if not (0 < y_rel < self.lookahead):
-        #     return None
-
-        # perspective projection 
-        inv_z = 1.0 / y_rel
-        screen_x = int(self.panel_width // 2 + x_rel * inv_z * self.fov)
-        # vertical projection using camera height
-        screen_y = int(
-            self.horizon_y * self.panel_height
-            + self.camera_height * inv_z * self.panel_height * self.vertical_scale
-        )
-
-        if 0 <= screen_y < self.panel_height and 0 <= screen_x < self.panel_width:
-            return screen_y, screen_x
-        
-        return None
-
-    def _lod_step(self, y_rel):
-        if y_rel < 0.2* self.lookahead:
-            return 1      # very near
-        elif y_rel < 0.4*self.lookahead:
-            return 2
-        elif y_rel < 0.7*self.lookahead:
-            return 4
-        else:
-            return 16      # far away
-    
     def _build_track_points(self, i):
-        left_points = []
-        centre_points = []
-        right_points = []
-
         cam_heading = self._calculate_car_heading(i, 1)
         cam_x, cam_y = self._car_to_track_co_ords(self.x_car[i], self.y_car[i])
 
-        j = 0
-        while j < len(self.x_track):
-            xt = self.x_track[j]
-            yt = self.y_track[j]
-            wl = self.width_left[j]
-            wr = self.width_right[j]
-            
-            track_heading = self._calculate_track_heading(j, 1)
-            normal_x = -math.sin(track_heading)
-            normal_y =  math.cos(track_heading)
-
-            x_left, y_left = xt + (normal_x * wl), yt + (normal_y * wl)
-            x_right, y_right = xt - (normal_x * wr), yt - (normal_y * wr)
-
-            left_point = self._project_point(x_left, y_left, cam_x, cam_y, cam_heading)
-            centre_point = self._project_point(xt, yt, cam_x, cam_y, cam_heading)
-            right_point = self._project_point(x_right, y_right, cam_x, cam_y, cam_heading)
-
-            left_points.append(left_point)
-            centre_points.append(centre_point)
-            right_points.append(right_point)
-            
-            dx = xt - cam_x
-            dy = yt - cam_y
-            j += self._lod_step(y_rel=(dx * math.sin(cam_heading) + dy * math.cos(cam_heading)))
-
-        return left_points, centre_points, right_points
-
-    def generate_frame(self, i):
-        left_points, centre_points, right_points = self._build_track_points(i)
-        buf = [[' '] * self.panel_width for _ in range(self.panel_height)]
-        for left_point, centre_point, right_point in zip(left_points, centre_points, right_points):
-            if left_point is not None:
-                row, col = left_point
-                if 0 <= row < self.panel_height and 0 <= col < self.panel_width:
-                    buf[row][col] = '|'
-                    
-            if centre_point is not None:
-                row, col = centre_point
-                if 0 <= row < self.panel_height and 0 <= col < self.panel_width:
-                    buf[row][col] = '.'
-            
-            if right_point is not None:
-                row, col = right_point
-                if 0 <= row < self.panel_height and 0 <= col < self.panel_width:
-                    buf[row][col] = '|'
+        cos_h = math.cos(-cam_heading)
+        sin_h = math.sin(-cam_heading)
         
-                    
-        return '\n'.join(''.join(row) for row in buf)
+        left_xy = self.track_xy + self.normals * self.width_left[:, None]
+        right_xy = self.track_xy - self.normals * self.width_right[:, None]
 
+        def project(points):
+            dx = points[:, 0] - cam_x
+            dy = points[:, 1] - cam_y
+
+            # rotate points into camera view
+            x_rel = dx * cos_h - dy * sin_h
+            y_rel = dx * sin_h + dy * cos_h
+
+            # remove points behind camera
+            mask = y_rel > 0
+            x_rel = x_rel[mask]
+            y_rel = y_rel[mask]
+            
+            # perspective
+            inv_z = 1.0 / y_rel
+            screen_x = (self.panel_width / 2 + x_rel * inv_z * self.focal_length).astype(int)
+            screen_y = (
+                self.horizon_y * self.panel_height
+                + self.camera_height * inv_z * self.panel_height
+            ).astype(int)
+
+            valid = (
+                (screen_x >= 0) & (screen_x < self.panel_width) &
+                (screen_y >= 0) & (screen_y < self.panel_height)
+            )
+            return screen_y[valid], screen_x[valid]
+
+        cy, cx = project(self.track_xy)
+        ly, lx = project(left_xy)
+        ry, rx = project(right_xy)
+
+        return (cy, cx), (ly, lx), (ry, rx)
+
+    def _rasterise_triangle(self, buf, v1, v2, v3, char='.'):
+        h = self.panel_height
+        w = self.panel_width
+
+        x1, y1 = v1[1], v1[0]
+        x2, y2 = v2[1], v2[0]
+        x3, y3 = v3[1], v3[0]
+
+        # Bounding box (clamped to screen)
+        min_x = max(0, int(min(x1, x2, x3)))
+        max_x = min(w - 1, int(max(x1, x2, x3)))
+        min_y = max(0, int(min(y1, y2, y3)))
+        max_y = min(h - 1, int(max(y1, y2, y3)))
+
+        def edge(ax, ay, bx, by, px, py):
+            return (px - ax) * (by - ay) - (py - ay) * (bx - ax)
+
+        # Rasterise
+        for y in range(min_y, max_y + 1):
+            for x in range(min_x, max_x + 1):
+                w1 = edge(x1, y1, x2, y2, x, y)
+                w2 = edge(x2, y2, x3, y3, x, y)
+                w3 = edge(x3, y3, x1, y1, x, y)
+
+                if (w1 >= 0 and w2 >= 0 and w3 >= 0) or (w1 <= 0 and w2 <= 0 and w3 <= 0):
+                    if 0 <= y < h and 0 <= x < w:
+                        if buf[y][x] == ' ':
+                            buf[y][x] = char
+
+    def _project_points(self, points, cam_x, cam_y, cos_h, sin_h):
+        dx = points[:, 0] - cam_x
+        dy = points[:, 1] - cam_y
+
+        x_rel = dx * cos_h - dy * sin_h
+        y_rel = dx * sin_h + dy * cos_h
+
+        mask = y_rel > 0.5
+        
+        inv_z = 1.0 / y_rel
+
+        screen_x = (self.panel_width / 2 + x_rel * inv_z * self.focal_length).astype(int)
+        screen_y = (
+            self.horizon_y * self.panel_height
+            + self.camera_height * inv_z * self.panel_height
+        ).astype(int)
+
+        valid = (
+            mask &
+            (screen_x >= 0) & (screen_x < self.panel_width) &
+            (screen_y >= 0) & (screen_y < self.panel_height)
+        )
+
+        return screen_y, screen_x, valid
+    
+    def _plot(self, buf, r, c, char):
+        if 0 <= r < self.panel_height and 0 <= c < (self.panel_width):
+            buf[r][c] = char
+    
+    def generate_frame(self, i):
+        buf = [[' '] * (self.panel_width) for _ in range(self.panel_height)]
+        (cy, cx), (ly, lx), (ry, rx) = self._build_track_points(i)
+
+        # cam_heading = self._calculate_car_heading(i, 1)
+        # cam_x, cam_y = self._car_to_track_co_ords(self.x_car[i], self.y_car[i])
+
+        # cos_h = math.cos(-cam_heading)
+        # sin_h = math.sin(-cam_heading)
+
+        # # World points
+        # left_xy = self.track_xy + self.normals * self.width_left[:, None]
+        # right_xy = self.track_xy - self.normals * self.width_right[:, None]
+
+        # # Project ALL
+        # cy, cx, c_valid = self._project_points(self.track_xy, cam_x, cam_y, cos_h, sin_h)
+        # ly, lx, l_valid = self._project_points(left_xy, cam_x, cam_y, cos_h, sin_h)
+        # ry, rx, r_valid = self._project_points(right_xy, cam_x, cam_y, cos_h, sin_h)
+
+        # buf = [[' '] * (self.panel_width) for _ in range(self.panel_height)]
+
+        # n = len(self.track_xy)
+
+        # for j in range(n - 1):
+        #     # Skip if any of the 4 points are invalid
+        #     if not (l_valid[j] or r_valid[j] or l_valid[j+1] or r_valid[j+1]):
+        #         continue
+            
+        #     L1 = (ly[j], lx[j])
+        #     R1 = (ry[j], rx[j])
+        #     L2 = (ly[j+1], lx[j+1])
+        #     R2 = (ry[j+1], rx[j+1])
+            
+        #     # Rasterise 2 triangles
+        #     self._rasterise_triangle(buf, L1, R1, L2)
+        #     self._rasterise_triangle(buf, R1, R2, L2)
+        
+        
+        # . for centre line, | for track edges
+        for r, c in zip(cy, cx):
+            self._plot(buf, r, c, '"')
+        
+        for r, c in zip(ly, lx):
+            self._plot(buf, r, c, '|')
+
+        for r, c in zip(ry, rx):
+            self._plot(buf, r, c, '|')
+        
+        return '\n'.join(''.join(row) for row in buf)
 
 
 class TelemetryAsciiPanel:
@@ -263,27 +287,116 @@ class TelemetryAsciiPanel:
         self.panel_height = panel_height
         self.laps_data = laps_data
         self.telemetry = laps_data.telemetry
+        
+        self.speed_arr = self.telemetry['Speed'].to_numpy()
+        self.rpm_arr = self.telemetry['RPM'].to_numpy()
+        self.throttle_arr = self.telemetry['Throttle'].to_numpy()
+        self.brake_arr = self.telemetry['Brake'].to_numpy()
+        self.ngear_arr = self.telemetry['nGear'].to_numpy()
+        self.drs_arr = self.telemetry['DRS'].to_numpy()
+        self.date_arr = self.telemetry['Date'].to_numpy()
+        self.session_time_arr = self.telemetry['SessionTime'].to_numpy()
+        
+        self.bar_colours = _generate_throttle_gradient(20)
+        self.gears = ['N', '1', '2', '3', '4', '5', '6', '7', '8']
+        
+        # initalise speedometer
+        self.speedometer_width = 32
+        self.speedometer_height = 3
+        self.speedometer_perimeter = self.speedometer_width + self.speedometer_height * 2 - 2
+        self.grid = [[" " for _ in range(self.speedometer_width)] for _ in range(self.speedometer_height)]
+        self.path = []
+        # 1. LEFT column (bottom → top)
+        for y in range(self.speedometer_height - 1, 0, -1):
+            self.path.append((y, 0))
+        # 2. TOP row (left → right)
+        for x in range(0, self.speedometer_width):
+            self.path.append((0, x))
+        # 3. RIGHT column (top → bottom)
+        for y in range(1, self.speedometer_height):
+            self.path.append((y, self.speedometer_width - 1))
 
+        # Draw border
+        for i, (y, x) in enumerate(self.path):
+            # Choose char based on position
+            if y == 0 and x == 0:
+                self.grid[y][x] = '╭'
+            elif y == 0 and x == self.speedometer_width - 1:
+                self.grid[y][x] = '╮'
+            elif y == self.speedometer_height-1 and x == 0:
+                self.grid[y][x] = '0'
+            elif y == self.speedometer_height-1 and x == self.speedometer_width - 1:
+                self.grid[y][x] = 'x'
+            elif y == 0:
+                self.grid[y][x] = '─'
+            else:
+                self.grid[y][x] = '│'
+                
+
+    def _render_throttle_brake_bar(self, throttle_percent, brake, bar_length=20):
+        return ['[#FF0000]<[/]']*bar_length if brake else [f'[bold {self.bar_colours[idx]}]>[/]' if idx <= throttle_percent // (100/len(self.bar_colours)) else '>' for idx in range(len(self.bar_colours))]
+    
+    def _render_rpm_bar(self, rpm, bar_length=20, max_rpm=15000, rpm_red_point=10000):
+        # Three sections of the bar - blue and red for the RPM and blank. 
+        # Red is for above 10000RPM, chosen to estimate the "upshift" RPM value. Change this ad lib.
+        rpm_bar = f'[blue]{"●"*int(rpm/max_rpm * bar_length)}{"○"*(bar_length-int((rpm)/max_rpm * bar_length))}[/]'
+        red_index = 6 + int(rpm_red_point/max_rpm * bar_length) - 1
+        return rpm_bar[:red_index] + '[/][red]' + rpm_bar[red_index:]
+    
+    def _render_gear(self, n_gear):
+        n_gear = str(n_gear) if n_gear != 0 else 'N'
+        return ' '.join(
+            [f'[grey]{num}[/]' if num != n_gear else f'[blue bold underline]{num}[/]'
+             for num in self.gears
+             ])
+    
+    def _accel_curve(self, p, curve_index=2):
+        # 2 -> quadratic
+        return 1 - (1 - p) ** curve_index
+    
+    def _render_speedometer(self, speed, throttle, brake):
+        # shallow copy per row
+        grid_buffer = [row[:] for row in self.grid]
+        filled = int(self._accel_curve(min(speed / 350, 1)) * self.speedometer_perimeter)
+        for i, (y, x) in enumerate(self.path):
+            if i < filled:
+                grid_buffer[y][x] = f'[green]{grid_buffer[y][x]}[/]'
+
+        # Speed text in center
+        speed_str = f"{int(speed)} km/h"
+        cx = (self.speedometer_width - len(speed_str)) // 2
+        throttle_just = str(throttle).rjust(2, ' ')
+        throttle_brake_bar = self._render_throttle_brake_bar(throttle, brake)
+        throttle_brake_str = (
+            [' ']*5 + throttle_brake_bar + [' ', '[red]B', 'R', 'K[/]'] 
+        ) if brake else (
+            [' ', f'[green]{throttle_just[0]}', throttle_just[1], '%[/]', ' '] + throttle_brake_bar)
+        
+        for i, char in enumerate(speed_str):
+            grid_buffer[1][cx + i] = char
+
+        for i, char in enumerate(throttle_brake_str):
+            grid_buffer[2][1 + i] = char
+
+        return '\n'.join([''.join(row) for row in grid_buffer])
+    
     def generate_frame(self, i):
-        bar_colours = _generate_throttle_gradient(self.panel_width // 2)
+        speed = self.speed_arr[i]
+        rpm = int(self.rpm_arr[i])
+        throttle_percent = int(self.throttle_arr[i])
+        brake = self.brake_arr[i]
+        n_gear = self.ngear_arr[i]
+        drs = DRS_KEY[self.drs_arr[i]]
+        date = self.date_arr[i]
+        session_time = self.session_time_arr[i]
         
-        speed = self.telemetry['Speed'].iloc[i]
-        rpm = int(self.telemetry['RPM'].iloc[i])
-        throttle_percent = int(self.telemetry['Throttle'].iloc[i])
-        throttle_bar = ''.join(f'[{bar_colours[idx]}]█[/]' if idx <= throttle_percent // (100/len(bar_colours)) else ' ' for idx in range(len(bar_colours)))
-        brake = "[bold green]ON[/]" if self.telemetry['Brake'].iloc[i] else "[bold red]OFF[/]"
-        gear = self.telemetry['nGear'].iloc[i]
-        gear = f'[bold #00d7ff]{gear}[/]' if gear != 0 else '[bold #00d7ff]N[/]'
-        drs = DRS_KEY[self.telemetry['DRS'].iloc[i]]
-        date = self.telemetry['Date'].iloc[i]
-        session_time = self.telemetry['SessionTime'].iloc[i]
+        rpm_bar = self._render_rpm_bar(rpm)
+        speedometer = self._render_speedometer(speed, throttle_percent, brake)
+        gear_display = self._render_gear(n_gear)
         
-        return f"""Speed: {int(speed)} km/h
-RPM: {rpm}
-Throttle: |{throttle_bar}| {throttle_percent}%
-Brake: {brake}
-Gear: {gear}
-DRS: {drs}
+        return f"""{speedometer} DRS: {drs}
+GEAR: {gear_display}
+RPM |{rpm_bar}| {rpm}
 Session Time: {session_time}
 Date: {date}"""
 
@@ -415,13 +528,13 @@ class MinimapAsciiPanel:
 
     # ---------- Coordinate transforms ----------
     def _tel_to_screen(self, x, y):
-        gx = int((x - self.x_car_min) / (self.x_car_max - self.x_car_min) * (self.panel_width - 20)) + 10
-        gy = self.panel_height - 1 - int((y - self.y_car_min) / (self.y_car_max - self.y_car_min) * (self.panel_height - 10)) - 5
+        gx = int((x - self.x_car_min) / (self.x_car_max - self.x_car_min) * (self.panel_width - 10)) + 5
+        gy = self.panel_height - 1 - int((y - self.y_car_min) / (self.y_car_max - self.y_car_min) * (self.panel_height - 6)) - 3
         return gx, gy
 
     def _track_to_screen(self, x, y):
-        gx = int((x - self.x_track_min) / (self.x_track_max - self.x_track_min) * (self.panel_width - 20)) + 10
-        gy = self.panel_height - 1 - int((y - self.y_track_min) / (self.y_track_max - self.y_track_min) * (self.panel_height - 10)) - 5
+        gx = int((x - self.x_track_min) / (self.x_track_max - self.x_track_min) * (self.panel_width - 10)) + 5
+        gy = self.panel_height - 1 - int((y - self.y_track_min) / (self.y_track_max - self.y_track_min) * (self.panel_height - 6)) - 3
         return gx, gy
     
     def _rotate(self, xy, *, angle):
@@ -467,9 +580,9 @@ class MinimapAsciiPanel:
                     buf[cy][cx] = "#"
 
             self._draw_corner_numbers(buf, self.corners)
-            self.track_map_cache = deepcopy(buf)
+            self.track_map_cache = [row[:] for row in buf]
         else:
-            buf = deepcopy(self.track_map_cache)
+            buf = [row[:] for row in self.track_map_cache]
 
         # Draw car position
         gx, gy = self._tel_to_screen(self.x_car[i], self.y_car[i])
@@ -508,38 +621,41 @@ class RaceControlMessagesAsciiPanel:
             return ""
 
 class F1AsciiReplayDisplay:
-    def __init__(self, telemetry_loader, racetrack_database_loader, terminal_width=None, terminal_height=None, fov=40.0, lookahead=50.0, camera_height=0.5, horizon_y=0.1, vertical_scale=1.2, refresh_rate=1/30):
+    def __init__(self, telemetry_loader, racetrack_database_loader, terminal_width=None, terminal_height=None, fov=60.0, lookahead=50.0, camera_height=10, horizon_y=0.2, refresh_rate=1/30):
         self.refresh_rate = refresh_rate
         
         track_data = racetrack_database_loader.get_track_data()
         session = telemetry_loader.get_session()
         session.load()
-        self.laps_data = session.laps.pick_drivers(['NOR'])
+        self.laps_data = session.laps.pick_drivers(['ALB'])
         self.laps_data.reset_index(drop=True)
         corners = session.get_circuit_info().corners
         race_control_messages = session.race_control_messages
         gmt_offset = session.session_info['GmtOffset']
         
+        # These dimensions have been mostly judged arbitrarily in terms of ratios - the 8 line high windows are to match the amount of space the given data takes up, 
+        # and the subtractions are for border thicknesses. The exact workings on this I'm lost on, blame Rich.
+        
         self.terminal_width = terminal_width or (shutil.get_terminal_size()[0])
         self.terminal_height = terminal_height or (shutil.get_terminal_size()[1])
         
-        self.race_control_messages_ascii_panel_width = int((self.terminal_width - 2) * 0.65)
+        self.race_control_messages_ascii_panel_width = int((self.terminal_width) * 0.65) - 4
         self.race_control_messages_ascii_panel_height = 4
         
-        self.driver_view_ascii_panel_width = int((self.terminal_width - 2) * 0.65)
-        self.driver_view_ascii_panel_height = self.terminal_height - self.race_control_messages_ascii_panel_height - 4
+        self.driver_view_ascii_panel_width = int((self.terminal_width) * 0.65) - 4
+        self.driver_view_ascii_panel_height = self.terminal_height - self.race_control_messages_ascii_panel_height - 9 - 4
         
-        self.telemetry_ascii_panel_width = self.terminal_width - self.driver_view_ascii_panel_width
-        self.telemetry_ascii_panel_height = 8
+        self.lap_data_ascii_panel_width = self.driver_view_ascii_panel_width // 2 - 2
+        self.lap_data_ascii_panel_height = 7
         
-        self.sector_timing_ascii_panel_width = self.terminal_width - self.driver_view_ascii_panel_width
+        self.telemetry_ascii_panel_width = self.driver_view_ascii_panel_width - self.lap_data_ascii_panel_width - 4
+        self.telemetry_ascii_panel_height = 7
+        
+        self.sector_timing_ascii_panel_width = self.terminal_width - self.race_control_messages_ascii_panel_width - 8
         self.sector_timing_ascii_panel_height = 8
         
-        self.lap_data_ascii_panel_width = self.terminal_width - self.driver_view_ascii_panel_width
-        self.lap_data_ascii_panel_height = 8
-        
-        self.minimap_ascii_panel_width = self.terminal_width - self.driver_view_ascii_panel_width
-        self.minimap_ascii_panel_height = self.terminal_height - self.sector_timing_ascii_panel_height - self.lap_data_ascii_panel_height - self.telemetry_ascii_panel_height - 8
+        self.minimap_ascii_panel_width = self.terminal_width - self.race_control_messages_ascii_panel_width - 8
+        self.minimap_ascii_panel_height = self.terminal_height - self.sector_timing_ascii_panel_height - 4
         
         self.driver_view_ascii_panel = DriverViewAsciiPanel(
             panel_width=self.driver_view_ascii_panel_width,
@@ -549,8 +665,7 @@ class F1AsciiReplayDisplay:
             fov=fov,
             lookahead=lookahead,
             camera_height=camera_height,
-            horizon_y=horizon_y,
-            vertical_scale=vertical_scale
+            horizon_y=horizon_y
         )
         
         self.telemetry_ascii_panel = TelemetryAsciiPanel(
@@ -590,17 +705,20 @@ class F1AsciiReplayDisplay:
     def main(self):
         layout = Layout()
         layout.split_row(
-            Layout(name="left", size=self.race_control_messages_ascii_panel_width),
-            Layout(name="right", size=self.telemetry_ascii_panel_width)
+            Layout(name="left", size=self.race_control_messages_ascii_panel_width + 4),
+            Layout(name="right", size=self.sector_timing_ascii_panel_width + 4)
         )
         layout["left"].split_column(
             Layout(name='race_control_messages', size=self.race_control_messages_ascii_panel_height + 2),
-            Layout(name='driver_view', size=self.driver_view_ascii_panel_height + 2)
+            Layout(name='driver_view', size=self.driver_view_ascii_panel_height + 2),
+            Layout(name='bottom_left', size=self.lap_data_ascii_panel_height + 2)
+        )
+        layout['bottom_left'].split_row(
+            Layout(name="lap_data", size=self.lap_data_ascii_panel_width + 4),
+            Layout(name="telemetry", size=self.telemetry_ascii_panel_width + 4),
         )
         layout["right"].split_column(
             Layout(name="sector_timing", size=self.sector_timing_ascii_panel_height + 2),
-            Layout(name="lap_data", size=self.lap_data_ascii_panel_height + 2),
-            Layout(name="telemetry", size=self.telemetry_ascii_panel_height + 2),
             Layout(name="minimap", size=self.minimap_ascii_panel_height + 2)
         )
         lap = 1
@@ -608,7 +726,7 @@ class F1AsciiReplayDisplay:
         lap_numbers = self.laps_data['LapNumber']
         telemetry = self.laps_data.telemetry
         with Live(layout, screen=False, refresh_per_second=1/self.refresh_rate):
-            for i in range(len(telemetry)):
+            for i in range(len(telemetry)): 
                 start_time = datetime.now()
                 clock = telemetry['Date'].iloc[i].to_pydatetime()
                 # checks if time has passed the start time for the next lap, then increments if necessary. relies on lap data to increment.
@@ -622,16 +740,16 @@ class F1AsciiReplayDisplay:
                 minimap_frame = self.minimap_ascii_panel.generate_frame(i)
                 race_control_messages_frame = self.race_control_messages_ascii_panel.generate_frame(i)
                 
-                driver_view_panel = Panel(driver_view_frame, title="Driver View", width=self.driver_view_ascii_panel_width + 2, height=self.driver_view_ascii_panel_height + 2)
-                lap_data_panel = Panel(lap_data_frame, title="Lap Data", width=self.lap_data_ascii_panel_width + 2, height=self.lap_data_ascii_panel_height + 2)
-                sector_timing_panel = Panel(sector_timing_frame, title="Sector Timing", width=self.sector_timing_ascii_panel_width + 2, height=self.sector_timing_ascii_panel_height + 2)
-                telemetry_panel = Panel(telemetry_frame, title="Telemetry", width=self.telemetry_ascii_panel_width + 2, height=self.telemetry_ascii_panel_height + 2)
-                minimap_panel = Panel(minimap_frame, title="Minimap", width=self.minimap_ascii_panel_width + 2, height=self.minimap_ascii_panel_height + 2)
-                race_control_messages_panel = Panel(race_control_messages_frame, title="Race Control", width=self.race_control_messages_ascii_panel_width + 2, height=self.race_control_messages_ascii_panel_height + 2)
+                driver_view_panel = Panel(driver_view_frame, title="Driver View", width=self.driver_view_ascii_panel_width + 4, height=self.driver_view_ascii_panel_height + 2)
+                lap_data_panel = Panel(lap_data_frame, title="Lap Data", width=self.lap_data_ascii_panel_width + 4, height=self.lap_data_ascii_panel_height + 2)
+                sector_timing_panel = Panel(sector_timing_frame, title="Sector Timing", width=self.sector_timing_ascii_panel_width + 4, height=self.sector_timing_ascii_panel_height + 2)
+                telemetry_panel = Panel(telemetry_frame, title="Telemetry", width=self.telemetry_ascii_panel_width + 4, height=self.telemetry_ascii_panel_height + 2)
+                minimap_panel = Panel(minimap_frame, title="Minimap", width=self.minimap_ascii_panel_width + 4, height=self.minimap_ascii_panel_height + 2)
+                race_control_messages_panel = Panel(race_control_messages_frame, title="Race Control", width=self.race_control_messages_ascii_panel_width + 4, height=self.race_control_messages_ascii_panel_height + 2)
                 
                 layout['driver_view'].update(driver_view_panel)
-                layout['sector_timing'].update(lap_data_panel)
-                layout['lap_data'].update(sector_timing_panel)
+                layout['sector_timing'].update(sector_timing_panel)
+                layout['lap_data'].update(lap_data_panel)
                 layout['telemetry'].update(telemetry_panel)
                 layout['minimap'].update(minimap_panel)
                 layout['race_control_messages'].update(race_control_messages_panel)
@@ -641,7 +759,9 @@ class F1AsciiReplayDisplay:
                 # if time_delta > 0:
                 #     time.sleep(time_delta)
                 
-                time.sleep(self.refresh_rate)
+                elapsed = (datetime.now() - start_time).total_seconds()
+                sleep_time = max(0, self.refresh_rate - elapsed)
+                time.sleep(sleep_time)
 
 if __name__ == "__main__":
     telemetry_loader = TelemetryLoader(2025, 'Silverstone', 'R')
